@@ -1,0 +1,6 @@
+# Ignora tutto
+*
+
+# Includi solo gli script
+!.gitignore
+!proxmox-cheshire-ultimate.sh
