@@ -18,6 +18,10 @@ Installa e configura in un solo comando: Docker, Ollama, il modello LLM Qwen3:8b
 ## Installazione
 
 ```bash
+# Installa git (se non presente)
+sudo apt-get update && sudo apt-get install -y git
+
+# Clona il repository e lancia lo script
 git clone https://github.com/tanismezz/proxmox-cheshire-ultimate.git
 sudo bash proxmox-cheshire-ultimate/proxmox-cheshire-ultimate.sh
 ```
@@ -56,6 +60,41 @@ Settings > Embedder > **Qdrant FastEmbed**
 | Campo | Valore |
 |-------|--------|
 | Model | `BAAI/bge-small-en-v1.5` |
+
+## Cambiare modello LLM
+
+Lo script installa di default `qwen3:8b`. Per usare un modello diverso:
+
+```bash
+# Vedi i modelli disponibili su https://ollama.com/library
+
+# Scarica un nuovo modello
+ollama pull llama3.1:8b
+
+# Vedi i modelli installati
+ollama list
+
+# Rimuovi un modello che non usi più
+ollama rm qwen3:8b
+```
+
+Alcuni modelli consigliati:
+
+| Modello | RAM minima | Descrizione |
+|---------|-----------|-------------|
+| `qwen3:8b` | 12 GB | Default, ottimo bilanciamento (multilingua) |
+| `llama3.1:8b` | 12 GB | Meta, ottime prestazioni generali |
+| `mistral:7b` | 10 GB | Veloce, buono per chat |
+| `gemma2:9b` | 12 GB | Google, buona qualità |
+| `qwen3:4b` | 6 GB | Leggero, per VM con poca RAM |
+| `llama3.1:70b` | 48 GB | Qualità top, richiede molta RAM |
+
+Dopo aver scaricato il nuovo modello, aggiorna la configurazione in Cheshire Cat:
+
+1. Apri `http://<IP-DELLA-VM>:1865/admin`
+2. Vai in **Settings > Language Model > Ollama Chat Model**
+3. Cambia il campo **Model** con il nome del nuovo modello (es. `llama3.1:8b`)
+4. Salva
 
 ## Comandi utili
 
