@@ -3,4 +3,5 @@
 
 # Includi solo gli script
 !.gitignore
+!README.md
 !proxmox-cheshire-ultimate.sh
