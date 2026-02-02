@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ╔═══════════════════════════════════════════════════════════════════════╗
-# ║  CHESHIRE CAT AI + OLLAMA - INSTALLER AUTOMATICO PROXMOX VM          ║
+# ║  CHESHIRE CAT AI + OLLAMA - INSTALLER AUTOMATICO PROXMOX VM / CT    ║
 # ║  Production-Ready Script con Error Handling Completo                 ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 #
@@ -101,6 +101,8 @@ INSTALL_START_TIME=""
 ERRORS_ENCOUNTERED=0
 WARNINGS_ENCOUNTERED=0
 INSTALL_DIR=""
+IS_CT=false       # true se in esecuzione dentro un container LXC
+IS_BAREMETAL=false # true se in esecuzione su hardware fisico (no hypervisor)
 
 #==============================================================================
 # LOGGING AVANZATO
@@ -310,7 +312,25 @@ preflight_checks() {
         exit 1
     fi
     success "✓ Privilegi root verificati"
-    
+
+    # Detect environment: VM vs CT vs Bare-metal
+    local virt_type
+    virt_type=$(systemd-detect-virt 2>/dev/null || echo "none")
+    if [ "$virt_type" = "lxc" ]; then
+        IS_CT=true
+        IS_BAREMETAL=false
+        success "✓ Ambiente rilevato: Proxmox LXC Container"
+        info "Lo script si adatterà automaticamente all'ambiente CT"
+    elif [ "$virt_type" = "none" ]; then
+        IS_CT=false
+        IS_BAREMETAL=true
+        success "✓ Ambiente rilevato: Bare-metal (nessun hypervisor)"
+    else
+        IS_CT=false
+        IS_BAREMETAL=false
+        success "✓ Ambiente rilevato: VM ($virt_type)"
+    fi
+
     # Debian version check
     if [ ! -f /etc/debian_version ]; then
         error "Sistema non Debian rilevato"
@@ -432,7 +452,6 @@ configure_system() {
     # Installazione utility (FIX: rimosso software-properties-common)
     info "Installazione utility essenziali..."
     local packages=(
-        qemu-guest-agent
         curl wget git
         vim nano
         htop iotop
@@ -444,26 +463,40 @@ configure_system() {
         jq bc
         ncdu
         unzip zip
+        zstd
     )
     
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${packages[@]}"
     success "Utility installate"
-    
-    # Qemu Guest Agent
-    info "Configurazione Qemu Guest Agent..."
-    systemctl enable qemu-guest-agent
-    systemctl start qemu-guest-agent || true
-    
-    if wait_for_service "qemu-guest-agent" 10; then
-        success "✓ Qemu Guest Agent attivo"
+
+    # Qemu Guest Agent (solo VM con hypervisor, inutile in CT e bare-metal)
+    if [ "$IS_CT" = false ] && [ "$IS_BAREMETAL" = false ]; then
+        info "Installazione e configurazione Qemu Guest Agent..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-guest-agent
+        systemctl enable qemu-guest-agent
+        systemctl start qemu-guest-agent || true
+
+        if wait_for_service "qemu-guest-agent" 10; then
+            success "✓ Qemu Guest Agent attivo"
+        else
+            warn "⚠ Qemu Agent non attivo - verifica Proxmox VM options"
+        fi
+    elif [ "$IS_CT" = true ]; then
+        info "CT rilevato: Qemu Guest Agent non necessario (skip)"
     else
-        warn "⚠ Qemu Agent non attivo - verifica Proxmox VM options"
+        info "Bare-metal rilevato: Qemu Guest Agent non necessario (skip)"
     fi
     
     # Timezone
     info "Configurazione timezone..."
-    timedatectl set-timezone Europe/Rome || warn "Impossibile impostare timezone"
-    success "Timezone: $(timedatectl | grep 'Time zone' | awk '{print $3}')"
+    if timedatectl set-timezone Europe/Rome 2>/dev/null; then
+        success "Timezone: $(timedatectl 2>/dev/null | grep 'Time zone' | awk '{print $3}')"
+    else
+        # Fallback per CT dove timedatectl potrebbe non funzionare
+        ln -sf /usr/share/zoneinfo/Europe/Rome /etc/localtime
+        echo "Europe/Rome" > /etc/timezone
+        success "Timezone: Europe/Rome (impostata via /etc/localtime)"
+    fi
     
  # NTP sync (DISABILITATO - Proxmox gestisce sync autonomamente)
 # if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
@@ -477,7 +510,7 @@ info "⏱️  Sincronizzazione orario gestita da Proxmox"
     
     # Kernel parameters
     info "Ottimizzazione parametri kernel..."
-    cat >> /etc/sysctl.d/99-cheshire-cat.conf << 'EOF'
+    cat > /etc/sysctl.d/99-cheshire-cat.conf << 'EOF'
 # Ottimizzazioni Cheshire Cat AI + Ollama
 vm.swappiness=10
 vm.overcommit_memory=1
@@ -491,9 +524,28 @@ net.ipv4.tcp_tw_reuse=1
 net.bridge.bridge-nf-call-iptables=1
 net.ipv4.ip_forward=1
 EOF
-    
-    sysctl -p /etc/sysctl.d/99-cheshire-cat.conf > /dev/null 2>&1 || true
-success "✓ Kernel ottimizzato (parametri bridge si applicheranno post-Docker)"
+
+    # In CT alcuni parametri sono read-only: applicare uno alla volta
+    local sysctl_ok=0
+    local sysctl_skip=0
+    while IFS='=' read -r key value; do
+        # Salta commenti e righe vuote
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+        if sysctl -w "${key}=${value}" > /dev/null 2>&1; then
+            sysctl_ok=$((sysctl_ok + 1))
+        else
+            sysctl_skip=$((sysctl_skip + 1))
+            debug "sysctl ${key} non scrivibile (normale in CT)"
+        fi
+    done < /etc/sysctl.d/99-cheshire-cat.conf
+
+    if [ "$IS_CT" = true ] && [ "$sysctl_skip" -gt 0 ]; then
+        success "✓ Kernel: ${sysctl_ok} parametri applicati, ${sysctl_skip} read-only (normale in CT)"
+    else
+        success "✓ Kernel ottimizzato (${sysctl_ok} parametri applicati)"
+    fi
 
     
     save_state "SYSTEM_CONFIGURED"
@@ -509,6 +561,18 @@ configure_security() {
     if [ "$FIREWALL_ENABLED" != "true" ]; then
         warn "Firewall disabilitato (FIREWALL_ENABLED=false)"
         return 0
+    fi
+
+    # In CT, verificare che iptables funzioni prima di procedere
+    if [ "$IS_CT" = true ]; then
+        if ! iptables -L -n > /dev/null 2>&1; then
+            warn "⚠ CT senza supporto iptables/nftables: firewall non configurabile"
+            warn "⚠ Configura le regole firewall a livello host Proxmox"
+            FIREWALL_ENABLED="false"
+            save_state "SECURITY_CONFIGURED"
+            return 0
+        fi
+        info "CT con supporto iptables rilevato, procedo con UFW"
     fi
     
     # Backup UFW
@@ -551,9 +615,13 @@ configure_security() {
     ufw allow from 10.0.0.0/8 to any port 1865 proto tcp comment 'Cat LAN 10.x'
     ufw allow from 172.16.0.0/12 to any port 1865 proto tcp comment 'Cat LAN 172.x'
     
-    # Ollama (localhost only)
+    # Ollama (LAN — permette uso da Aider/altri client in rete)
+    info "Apertura porta 11434 (Ollama) per LAN..."
+    ufw allow from 192.168.0.0/16 to any port 11434 proto tcp comment 'Ollama LAN 192.168'
+    ufw allow from 10.0.0.0/8 to any port 11434 proto tcp comment 'Ollama LAN 10.x'
+    ufw allow from 172.16.0.0/12 to any port 11434 proto tcp comment 'Ollama LAN 172.x'
     ufw allow from 127.0.0.1 to any port 11434 proto tcp comment 'Ollama localhost'
-    ufw deny 11434/tcp comment 'Ollama block external'
+    ufw deny 11434/tcp comment 'Ollama block WAN'
     
     ufw --force enable > /dev/null
     success "✓ Firewall configurato"
@@ -588,6 +656,14 @@ EOF
     # info "Hardening SSH..."
 
     save_state "SECURITY_CONFIGURED"
+
+    # Se Docker è già installato, riavviarlo per ripristinare regole iptables post-UFW reset
+    if command -v docker &> /dev/null && systemctl is-enabled docker &> /dev/null; then
+        info "Riavvio Docker per ripristinare regole iptables post-UFW..."
+        systemctl reset-failed docker 2>/dev/null || true
+        systemctl restart docker
+        wait_for_service "docker" 20 || warn "Docker non riavviato, sarà gestito nello step successivo"
+    fi
 }
 
 #==============================================================================
@@ -640,8 +716,9 @@ EOF
     fi
     
     systemctl enable docker
+    systemctl reset-failed docker 2>/dev/null || true
     systemctl start docker
-    
+
     if ! wait_for_service "docker" 30; then
         error "Docker non avviato correttamente"
         exit 1
@@ -676,20 +753,9 @@ EOF
     DOCKER_BRIDGE_IP=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.17.0.1")
     success "✓ Docker bridge IP: $DOCKER_BRIDGE_IP"
     
-    # Firewall: Docker bridge → Ollama
-    # La regola ALLOW deve essere inserita PRIMA del DENY globale su 11434
-    # e deve coprire tutta la subnet Docker (172.16.0.0/12), non solo il gateway
+    # Firewall: conferma che Docker → Ollama è già coperto dalle regole LAN 172.16.0.0/12
     if [ "$FIREWALL_ENABLED" = "true" ]; then
-        # Trova la posizione della regola DENY 11434 e inserisci ALLOW prima
-        local deny_rule_num
-        deny_rule_num=$(ufw status numbered 2>/dev/null | grep "11434.*DENY" | head -1 | grep -oP '(?<=\[)\s*\d+' | tr -d ' ')
-        if [ -n "$deny_rule_num" ]; then
-            ufw insert "$deny_rule_num" allow from 172.16.0.0/12 to any port 11434 proto tcp comment 'Ollama from Docker'
-        else
-            ufw allow from 172.16.0.0/12 to any port 11434 proto tcp comment 'Ollama from Docker'
-        fi
-        ufw reload
-        success "✓ Subnet Docker (172.16.0.0/12) autorizzata per Ollama"
+        success "✓ Subnet Docker già coperta da regola LAN 172.16.0.0/12 per Ollama"
     fi
     
     # Docker daemon config
@@ -713,6 +779,7 @@ EOF
 }
 EOF
     
+    systemctl reset-failed docker 2>/dev/null || true
     systemctl restart docker
     wait_for_service "docker" 20
     success "✓ Docker ottimizzato"
@@ -854,6 +921,14 @@ download_model() {
 deploy_cheshire_cat() {
     section "STEP 6: Deploy Cheshire Cat v$CCAT_VERSION"
     
+    # Verifica che Docker sia attivo prima di procedere
+    if ! systemctl is-active --quiet docker; then
+        warn "Docker non attivo, tentativo di riavvio..."
+        systemctl reset-failed docker 2>/dev/null || true
+        systemctl restart docker
+        wait_for_service "docker" 30 || { error "Docker non avviabile"; exit 1; }
+    fi
+
     info "Creazione struttura directory..."
     mkdir -p "$INSTALL_DIR"/{data,plugins,static,logs}
     
@@ -867,8 +942,6 @@ deploy_cheshire_cat() {
     # Docker Compose
     info "Generazione docker-compose.yml..."
     cat > "$INSTALL_DIR/docker-compose.yml" << EOF
-version: '3.8'
-
 services:
   cheshire-cat-core:
     image: ghcr.io/cheshire-cat-ai/core:${CCAT_VERSION}
@@ -1181,14 +1254,24 @@ run_tests() {
         tests_failed=$((tests_failed + 1))
     fi
     
-    # Test 6: Qemu Agent
-    info "[6/6] Test Qemu Agent..."
-    if systemctl is-active --quiet qemu-guest-agent; then
-        success "✓ Qemu Agent attivo"
+    # Test 6: Qemu Agent (solo VM) / Ambiente CT / Bare-metal
+    if [ "$IS_CT" = false ] && [ "$IS_BAREMETAL" = false ]; then
+        info "[6/6] Test Qemu Agent..."
+        if systemctl is-active --quiet qemu-guest-agent; then
+            success "✓ Qemu Agent attivo"
+            tests_passed=$((tests_passed + 1))
+        else
+            warn "⚠ Qemu Agent non attivo"
+            tests_failed=$((tests_failed + 1))
+        fi
+    elif [ "$IS_CT" = true ]; then
+        info "[6/6] Test ambiente CT..."
+        success "✓ LXC Container rilevato (Qemu Agent non necessario)"
         tests_passed=$((tests_passed + 1))
     else
-        warn "⚠ Qemu Agent non attivo"
-        tests_failed=$((tests_failed + 1))
+        info "[6/6] Test ambiente bare-metal..."
+        success "✓ Bare-metal rilevato (Qemu Agent non necessario)"
+        tests_passed=$((tests_passed + 1))
     fi
     
     echo ""
@@ -1240,8 +1323,12 @@ EOF
     echo "   Warning: $WARNINGS_ENCOUNTERED"
     echo ""
     
+    local env_label="VM"
+    [ "$IS_CT" = true ] && env_label="CT"
+    [ "$IS_BAREMETAL" = true ] && env_label="Bare-metal"
+
     info "📍 ACCESSO ADMIN PORTAL:"
-    echo -e "   ${CYAN}Da VM:${NC}         http://localhost:1865/admin"
+    echo -e "   ${CYAN}Da ${env_label}:${NC}         http://localhost:1865/admin"
     echo -e "   ${CYAN}Da LAN:${NC}        http://$VM_IP:1865/admin"
     echo ""
     echo -e "   ${YELLOW}${BOLD}Credenziali:${NC}"
@@ -1282,11 +1369,15 @@ EOF
     echo ""
     
     info "🔒 SICUREZZA:"
-    echo "   ✓ Firewall UFW attivo"
-    echo "   ✓ Fail2ban configurato"
+    if [ "$FIREWALL_ENABLED" = "true" ]; then
+        echo "   ✓ Firewall UFW attivo"
+        echo "   ✓ Fail2ban configurato"
+    else
+        echo "   ⚠ Firewall gestito a livello host Proxmox"
+    fi
     echo "   ✓ SSH porta: $SSH_PORT"
     echo "   ✓ Cat: solo LAN"
-    echo "   ✓ Ollama: localhost + Docker"
+    echo "   ✓ Ollama: LAN (porta 11434 — utilizzabile da Aider, Open WebUI, ecc.)"
     echo ""
     
     if [ -f "$BACKUP_DIR/user-password.txt" ]; then
@@ -1342,7 +1433,7 @@ main() {
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
 ║       CHESHIRE CAT AI + OLLAMA - INSTALLER AUTOMATICO           ║
-║            Production-Ready per Proxmox VM                       ║
+║          Production-Ready per Proxmox VM / CT                    ║
 ║                                                                  ║
 ║  Debian 13 Trixie | Docker | Ollama | Qwen3:8b                  ║
 ║                                                                  ║
